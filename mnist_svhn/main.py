@@ -6,11 +6,14 @@ import torch
 import os
 import numpy as np
 from torchvision.datasets import MNIST, SVHN
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 
 from datasets import getPairedDataset
 from model import EncoderA, EncoderB, DecoderA, DecoderB
 from classifier import MNIST_Classifier, SVHN_Classifier
-from util import unpack_data
+from util import unpack_data, apply_poe
+
 
 import sys
 sys.path.append('../')
@@ -61,8 +64,6 @@ if __name__ == "__main__":
     parser.add_argument('--ckpt_path', type=str, default='../weights/mnist_svhn_cont',
                         help='save and load path for ckpt')
 
-
-
     args = parser.parse_args()
 
 # ------------------------------------------------
@@ -70,7 +71,6 @@ if __name__ == "__main__":
 
 EPS = 1e-9
 CUDA = torch.cuda.is_available()
-
 
 if CUDA:
     device = 'cuda'
@@ -85,7 +85,6 @@ MODEL_NAME = 'mnist_svhn_cont2-run_id%d-privA%02ddim-privB%02ddim-sh%02ddim-lamb
     args.lambda_text2, args.beta1,
     args.beta2, args.seed,
     args.batch_size, args.wseed)
-
 
 params = [args.n_privateA, args.n_privateB, args.n_shared, args.lambda_text1, args.lambda_text2, args.beta1, args.beta2]
 
@@ -316,7 +315,7 @@ def cross_acc_prior():
             reconB_cross = decB.forward2(torch.cat([privB, q['sharedA'].value], -1)).squeeze(0)
 
             ## poe acc ##
-            mu_poe, std_poe = probtorch.util.apply_poe(CUDA, q['sharedA'].dist.loc, q['sharedA'].dist.scale,
+            mu_poe, std_poe = apply_poe(CUDA, q['sharedA'].dist.loc, q['sharedA'].dist.scale,
                                                        q['sharedB'].dist.loc, q['sharedB'].dist.scale)
             q.normal(mu_poe,
                      std_poe,
@@ -412,7 +411,7 @@ def train(encA, decA, encB, decB, optimizer):
             q = encB(images2, num_samples=NUM_SAMPLES, q=q)
 
             ## poe ##
-            mu_poe, std_poe = probtorch.util.apply_poe(CUDA, q['sharedA'].dist.loc, q['sharedA'].dist.scale,
+            mu_poe, std_poe = apply_poe(CUDA, q['sharedA'].dist.loc, q['sharedA'].dist.scale,
                                                        q['sharedB'].dist.loc, q['sharedB'].dist.scale)
             q.normal(mu_poe,
                      std_poe,
@@ -539,10 +538,83 @@ for e in range(args.ckpt_epochs, args.epochs):
 
 
 
+
+
+def shared_latent(data_loader, encA, n_samples):
+    torch.manual_seed(1340)
+    random.seed(1340)
+    fixed_idxs = random.sample(range(len(data_loader.dataset)), n_samples)
+    fixed_XA = [0] * n_samples
+    fixed_XB = [0] * n_samples
+    labels = [0] * n_samples
+
+    for i, idx in enumerate(fixed_idxs):
+        dataT = data_loader.dataset[idx]
+        data = unpack_data(dataT, device)
+        labels[i] = dataT[0][1]
+        fixed_XA[i] = data[0].view(-1, NUM_PIXELS).squeeze(0)
+        fixed_XB[i] = data[1]
+
+    fixed_XA = torch.stack(fixed_XA, dim=0)
+    fixed_XB = torch.stack(fixed_XB, dim=0)
+    labels = np.array(labels)
+
+    q = encA(fixed_XA, num_samples=1)
+    q = encB(fixed_XB, num_samples=NUM_SAMPLES, q=q)
+
+    ## poe ##
+    sharedPoE, _ = apply_poe(CUDA, q['sharedA'].dist.loc, q['sharedA'].dist.scale,
+                                               q['sharedB'].dist.loc, q['sharedB'].dist.scale)
+
+
+
+    ######################## shared digit id ########################
+    sharedA =  q['sharedA'].dist.loc
+    sharedB =  q['sharedB'].dist.loc
+    shared = torch.cat([sharedA, sharedB, sharedPoE], dim=1).detach().numpy().squeeze(0)
+
+    # total tsne
+    tsne = TSNE(n_components=2, random_state=0)
+    X_r2 = tsne.fit_transform(shared)
+
+    target_names = np.unique(labels)
+    colors = np.array(
+        ['burlywood', 'turquoise', 'darkorange', 'blue', 'green', 'gray', 'red', 'black', 'purple', 'pink'])
+
+    fig = plt.figure()
+    fig.tight_layout()
+    for color, i, target_name in zip(colors, target_names, target_names):
+        plt.scatter(X_r2[:n_samples][labels == i, 0], X_r2[:n_samples][labels == i, 1], alpha=0.7, color=color, marker='+', s=50, linewidths=1, label=target_name)
+        plt.scatter(X_r2[n_samples:2*n_samples][labels == i, 0], X_r2[n_samples:2*n_samples][labels == i, 1], alpha=0.6, color=color,
+                    s=7, linewidths=1, label=target_name)
+    plt.show()
+
+    ######################## all images of B ########################
+    tsne = TSNE(n_components=2, random_state=0)
+    emb = tsne.fit_transform(q['privateB'].dist.loc.detach().numpy().squeeze(0))
+
+    fig, ax = plt.subplots(**{'figsize': (4, 3)})
+
+    ax.scatter(emb[:,0], emb[:,1])
+    from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+    for x0, y0, img in zip(emb[:,0], emb[:,1], fixed_XB):
+        img = img.detach().numpy().transpose((1,2,0))
+        imagebox = OffsetImage(img, zoom=0.2)
+        imagebox.image.axes = ax
+        ab = AnnotationBbox(imagebox, (x0, y0), frameon=False)
+        ax.add_artist(ab)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+
+
 if args.ckpt_epochs == args.epochs:
+    shared_latent(test_loader, encA, 400)
     cross_acc_prior()
-
-
 
 else:
     save_ckpt(args.epochs)
